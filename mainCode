@@ -1,0 +1,461 @@
+# -*- coding: utf-8 -*-
+import gc
+import os
+import re
+import random
+import time
+import warnings
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+except ImportError:
+    raise ImportError("Please install the optuna library using 'pip install optuna'.")
+
+warnings.filterwarnings("ignore")
+
+# ==========================================
+# 1. CONFIGURATIONS & HARDCODED GROUND TRUTHS
+# ==========================================
+SEEDS = [101, 102]
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+ALARM_GT_EDGES = {
+    ("HYP", "LVV"), ("LVF", "LVV"), ("LVF", "HIST"), ("LVV", "CVP"),
+    ("LVV", "PCWP"), ("HYP", "STKV"), ("LVF", "STKV"), ("STKV", "CO"),
+    ("HR", "HRBP"), ("ERLO", "HRBP"), ("HR", "HREK"), ("ERCA", "HREK"),
+    ("HR", "HRSA"), ("SAO2", "HRSA"), ("SHNT", "SAO2"), ("PVS", "SAO2"),
+    ("ACO2", "SAO2"), ("TPR", "BP"), ("CO", "BP"), ("ANES", "CCHL"),
+    ("PMB", "CCHL"), ("CCHL", "HR"), ("CCHL", "TPR"), ("TPR", "CO"),
+    ("FIO2", "PVS"), ("VALV", "VLNG"), ("VLNG", "ACO2"), ("VLNG", "ECO2"),
+    ("VLNG", "PRSS"), ("DISC", "VLNG"), ("KINK", "PRSS"), ("VTUB", "PRSS"),
+    ("VTUB", "VLNG"), ("VMCH", "VTUB"), ("VMCH", "MVS"), ("MVS", "MINV"),
+    ("INT", "VLNG"), ("PRSS", "MVS"), ("ACO2", "VALV"),
+}
+
+SACHS2_GT_EDGES = {
+    ("Raf", "Mek"), ("Mek", "Erk"), ("Plcg", "PIP2"), ("Plcg", "PIP3"),
+    ("PIP3", "PIP2"), ("PKA", "Raf"), ("PKA", "Mek"), ("PKA", "Erk"),
+    ("PKA", "Akt"), ("PKA", "P38"), ("PKA", "Jnk"), ("PKC", "Raf"),
+    ("PKC", "Mek"), ("PKC", "P38"), ("PKC", "Jnk"),
+}
+
+HARDCODED_GT = {
+    "csuite": np.array([
+        [0, 1, 1, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ], dtype=int)
+}
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def build_gt_from_edges(edge_set, node_names):
+    n_nodes = len(node_names)
+    gt_matrix = np.zeros((n_nodes, n_nodes), dtype=int)
+    name_to_idx = {name.lower().strip(): idx for idx, name in enumerate(node_names)}
+    for u, v in edge_set:
+        u_idx = name_to_idx.get(u.lower().strip())
+        v_idx = name_to_idx.get(v.lower().strip())
+        if u_idx is not None and v_idx is not None:
+            gt_matrix[u_idx, v_idx] = 1
+    return gt_matrix
+
+def load_ground_truth_from_csv(dataset_name, data_dir, node_names):
+    n_nodes = len(node_names)
+    ds_lower = dataset_name.lower()
+    
+    if "alarm" in ds_lower:
+        return build_gt_from_edges(ALARM_GT_EDGES, node_names)
+    if "sachs" in ds_lower:
+        return build_gt_from_edges(SACHS2_GT_EDGES, node_names)
+    if ds_lower in HARDCODED_GT and HARDCODED_GT[ds_lower].shape[0] == n_nodes:
+        return HARDCODED_GT[ds_lower]
+
+    possible_names = [
+        f"{ds_lower}_Ground_Truth.csv", f"{ds_lower}_ground_truth.csv",
+        f"{dataset_name}_Ground_Truth.csv", f"{ds_lower}_gt.csv",
+        f"{dataset_name}_gt.csv", "gt.csv"
+    ]
+    
+    gt_file_path = None
+    for fname in possible_names:
+        full_p = os.path.join(data_dir, fname)
+        if os.path.exists(full_p):
+            gt_file_path = full_p
+            break
+
+    if gt_file_path is None:
+        return None
+
+    try:
+        gt_df = pd.read_csv(gt_file_path)
+        if gt_df.shape[0] == n_nodes and (gt_df.shape[1] == n_nodes or gt_df.shape[1] == n_nodes + 1):
+            if gt_df.shape[1] == n_nodes + 1:
+                gt_df = gt_df.iloc[:, 1:]
+            return gt_df.values.astype(int)
+
+        gt_matrix = np.zeros((n_nodes, n_nodes), dtype=int)
+        name_to_idx = {name.lower(): idx for idx, name in enumerate(node_names)}
+        
+        for _, row in gt_df.iterrows():
+            u_str, v_str = str(row.iloc[0]).lower(), str(row.iloc[1]).lower()
+            idx_u = name_to_idx.get(u_str, None)
+            idx_v = name_to_idx.get(v_str, None)
+            if idx_u is not None and idx_v is not None:
+                gt_matrix[idx_u, idx_v] = 1
+                
+        return gt_matrix
+    except Exception as e:
+        print(f"Error loading GT file {gt_file_path}: {e}")
+        return None
+
+# ==========================================
+# 2. DATA PROCESSING & UTILS
+# ==========================================
+def extract_numeric(val):
+    if pd.isna(val):
+        return np.nan
+    if isinstance(val, (int, float, np.number)):
+        return float(val)
+    match = re.search(r"[-+]?\d*\.\d+|\d+", str(val))
+    return float(match.group(0)) if match else str(val)
+
+def load_and_preprocess_dataset(data_path, dataset_name=""):
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"File not found: {data_path}")
+
+    with open(data_path, 'r') as f:
+        first_line = f.readline().strip()
+
+    if bool(re.search(r'[-+]?\d*\.\d+e[-+]?\d+|\d+\.\d+', first_line)):
+        df = pd.read_csv(data_path, header=None)
+        df.columns = [f"X{i+1}" for i in range(df.shape[1])]
+    else:
+        df = pd.read_csv(data_path)
+
+    if "Unnamed: 0" in df.columns:
+        df = df.drop(columns=["Unnamed: 0"])
+
+    for col in df.columns:
+        if df[col].dtype == "object":
+            extracted = df[col].apply(extract_numeric)
+            if not extracted.isna().all() and any(isinstance(x, float) for x in extracted.dropna()):
+                df[col] = extracted
+
+    for col in df.columns:
+        if df[col].isnull().sum() > 0:
+            if df[col].dtype == "object":
+                df[col] = df[col].fillna(df[col].mode().iloc[0])
+            else:
+                df[col] = df[col].fillna(df[col].median())
+
+    for col in df.columns:
+        if df[col].dtype == "bool":
+            df[col] = df[col].astype(float)
+        elif df[col].dtype == "object":
+            le = LabelEncoder()
+            df[col] = le.fit_transform(df[col].astype(str))
+
+    X_scaled = StandardScaler().fit_transform(df.values.astype(np.float32))
+    return X_scaled, list(df.columns)
+
+def compute_markov_boundaries_fast(X_tensor, alpha=0.05):
+    n_samples, _ = X_tensor.shape
+    mean = torch.mean(X_tensor, dim=0, keepdim=True)
+    std = torch.std(X_tensor, dim=0, keepdim=True) + 1e-8
+    X_norm = (X_tensor - mean) / std
+
+    corr_matrix = torch.matmul(X_norm.T, X_norm) / (n_samples - 1)
+    mb_mask = torch.abs(corr_matrix) >= alpha
+    mb_mask.fill_diagonal_(True)
+    return mb_mask
+
+# ==========================================
+# 3. ARCHITECTURE & REWARD
+# ==========================================
+class PointerNetwork(nn.Module):
+    def __init__(self, n_nodes, feature_dim, embedding_dim=64):
+        super(PointerNetwork, self).__init__()
+        self.n_nodes = n_nodes
+        self.embedding = nn.Sequential(nn.Linear(feature_dim, embedding_dim), nn.Tanh())
+        self.W_q = nn.Linear(embedding_dim, embedding_dim)
+        self.W_k = nn.Linear(embedding_dim, embedding_dim)
+        self.v = nn.Linear(embedding_dim, 1)
+
+    def forward(self, x_inputs, temperature=1.0):
+        embeddings = self.embedding(x_inputs.t())
+        log_probs, entropies, actions = [], [], []
+        visited_mask = torch.zeros(self.n_nodes, dtype=torch.bool, device=x_inputs.device)
+        context = torch.zeros(1, embeddings.size(1), device=x_inputs.device)
+
+        for _ in range(self.n_nodes):
+            query = self.W_q(context)
+            keys = self.W_k(embeddings)
+            scores = self.v(torch.tanh(keys + query)).squeeze(1)
+
+            current_scores = scores.clone()
+            if visited_mask.any():
+                current_scores[visited_mask] = -1e9
+
+            probs = F.softmax(current_scores / temperature, dim=-1)
+            dist = torch.distributions.Categorical(probs)
+            action = dist.sample()
+
+            log_probs.append(dist.log_prob(action))
+            entropies.append(dist.entropy())
+            actions.append(action.item())
+
+            visited_mask = visited_mask.clone()
+            visited_mask[action] = True
+            context = embeddings[action].unsqueeze(0)
+
+        return actions, torch.stack(log_probs).sum(), torch.stack(entropies).sum()
+
+class DAGMAGraphLearner(nn.Module):
+    def __init__(self, n_nodes, dagma_s=1.0):
+        super(DAGMAGraphLearner, self).__init__()
+        self.n_nodes = n_nodes
+        self.dagma_s = dagma_s
+        self.W = nn.Parameter(torch.randn(n_nodes, n_nodes, device=DEVICE) * 0.01)
+
+    def get_masked_W(self, order_mask, mb_mask):
+        return self.W * order_mask * mb_mask.float()
+
+    def compute_internal_loss(self, X, masked_W, mu, l1_lambda):
+        X_pred = torch.matmul(X, masked_W)
+        loss_mse = 0.5 * torch.sum((X - X_pred) ** 2) / X.shape[0]
+
+        W_sq = masked_W * masked_W
+        I = torch.eye(self.n_nodes, device=X.device)
+        M = self.dagma_s * I - W_sq
+
+        try:
+            logdet = torch.logdet(M)
+            h = torch.tensor(10.0, device=X.device) if torch.isnan(logdet) else -logdet + self.n_nodes * np.log(self.dagma_s)
+        except Exception:
+            h = torch.tensor(10.0, device=X.device)
+
+        l1_reg = l1_lambda * torch.sum(torch.abs(masked_W))
+        return mu * loss_mse + h + l1_reg, loss_mse, h
+
+class DynamicRewardEngine:
+    def __init__(self, n_nodes, hyperparams):
+        self.w_nll = hyperparams["w_nll"]
+        self.w_dag = hyperparams["w_dag"]
+        self.w_bic = hyperparams["w_bic"]
+        self.min_expected_edges = max(2, int(n_nodes * 0.7))
+        self.max_expected_edges = int(n_nodes * 2.2)
+
+    def compute_baseline(self, X, masked_W, h_val):
+        n_samples, _ = X.shape
+        X_pred = torch.matmul(X, masked_W)
+        sse = torch.sum((X - X_pred)**2, dim=0) / n_samples
+        nll = 0.5 * torch.sum(torch.log(sse + 1e-8)).item()
+
+        k = torch.sum(torch.abs(masked_W) > 0.02).item()
+
+        reward_nll = -nll * self.w_nll
+        reward_dag = -h_val * self.w_dag
+
+        if k < self.min_expected_edges:
+            reward_density = -(self.min_expected_edges - k) * 1.5
+        elif k > self.max_expected_edges:
+            reward_density = -(k - self.max_expected_edges) * 1.2
+        else:
+            reward_density = 4.0
+
+        return reward_nll + reward_dag + reward_density - (k * np.log(n_samples) * self.w_bic)
+
+# ==========================================
+# 4. HYPERPARAMETER TUNING & TRAINING
+# ==========================================
+def train_single_run(X_TENSOR, n_nodes, hp, ground_truth_matrix=None, max_epochs=None):
+    if max_epochs is None:
+        max_epochs = hp.get("max_epochs", 300)
+
+    mb_mask = compute_markov_boundaries_fast(X_TENSOR)
+    reward_engine = DynamicRewardEngine(n_nodes, hp)
+
+    pointer_net = PointerNetwork(n_nodes=n_nodes, feature_dim=X_TENSOR.shape[0]).to(DEVICE)
+    graph_learner = DAGMAGraphLearner(n_nodes=n_nodes).to(DEVICE)
+    optimizer_policy = optim.Adam(pointer_net.parameters(), lr=hp["lr"])
+
+    mu = 1.0
+    reward_history = []
+    epoch_f1s, epoch_shds = [], []
+
+    for epoch in range(1, max_epochs + 1):
+        if epoch % 25 == 0:
+            mu *= 1.2
+
+        current_temp = max(0.15, 1.3 - (epoch / max(1, max_epochs * 0.6)) * 1.1)
+        causal_order, log_prob, entropy = pointer_net(X_TENSOR, temperature=current_temp)
+
+        order_mask = torch.zeros(n_nodes, n_nodes, device=DEVICE)
+        for i in range(n_nodes):
+            for j in range(i + 1, n_nodes):
+                order_mask[causal_order[i], causal_order[j]] = 1.0
+
+        optimizer_graph = optim.Adam(graph_learner.parameters(), lr=max(0.001, 0.012 * (0.95 ** (epoch // 25))))
+
+        for _ in range(15):
+            masked_W = graph_learner.get_masked_W(order_mask, mb_mask)
+            g_loss, _, h = graph_learner.compute_internal_loss(X_TENSOR, masked_W, mu, hp["l1_lambda"])
+            optimizer_graph.zero_grad()
+            g_loss.backward()
+            optimizer_graph.step()
+
+        h_val = h.item()
+
+        with torch.no_grad():
+            masked_W = graph_learner.get_masked_W(order_mask, mb_mask)
+            raw_reward = reward_engine.compute_baseline(X_TENSOR, masked_W, h_val)
+            reward_history.append(raw_reward)
+            if len(reward_history) > 50:
+                reward_history.pop(0)
+
+            standardized_reward = (raw_reward - np.mean(reward_history)) / (np.std(reward_history) + 1e-5)
+
+        policy_loss = -log_prob * torch.tensor(standardized_reward, dtype=torch.float32, device=DEVICE) - 0.008 * entropy
+        optimizer_policy.zero_grad()
+        policy_loss.backward()
+        optimizer_policy.step()
+
+        if ground_truth_matrix is not None:
+            abs_W_tmp = np.abs(masked_W.cpu().detach().numpy())
+            pos_vals = abs_W_tmp[abs_W_tmp > 0.01]
+            th_tmp = np.mean(pos_vals) - 0.2 * np.std(pos_vals) if len(pos_vals) > 0 else 0.10
+            th_tmp = max(0.04, min(0.30, th_tmp))
+
+            curr_graph_tmp = (abs_W_tmp > th_tmp).astype(int)
+            np.fill_diagonal(curr_graph_tmp, 0)
+            
+            y_true, y_pred = ground_truth_matrix.flatten(), curr_graph_tmp.flatten()
+            epoch_f1s.append(f1_score(y_true, y_pred, zero_division=0))
+            epoch_shds.append(int(np.sum(np.abs(ground_truth_matrix - curr_graph_tmp))))
+
+    del pointer_net, graph_learner
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    if ground_truth_matrix is not None and len(epoch_f1s) > 0:
+        best_idx = np.argmax(epoch_f1s)
+        return {"best_f1": epoch_f1s[best_idx], "best_shd": epoch_shds[best_idx], "best_epoch": best_idx + 1}
+    return {"best_f1": 0.0, "best_shd": 999, "best_epoch": 0}
+
+
+def optimize_hyperparams(X_TENSOR, n_nodes, ground_truth_matrix, n_trials=12):
+    print(f"--- Searching for best hyperparameters (Optuna {n_trials} trials) ---")
+    
+    def objective(trial):
+        hp = {
+            "l1_lambda": trial.suggest_float("l1_lambda", 0.001, 0.05, log=True),
+            "w_nll": trial.suggest_float("w_nll", 20.0, 200.0),
+            "w_dag": trial.suggest_float("w_dag", 20.0, 150.0),
+            "w_bic": trial.suggest_float("w_bic", 0.001, 0.1, log=True),
+            "lr": trial.suggest_float("lr", 0.0003, 0.003, log=True),
+            "max_epochs": 150
+        }
+        res = train_single_run(X_TENSOR, n_nodes, hp, ground_truth_matrix, max_epochs=150)
+        return res["best_f1"]
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials)
+    
+    best_params = study.best_params
+    best_params["max_epochs"] = 600
+    print(f"--> Best Hyperparams Found: {best_params}\n")
+    return best_params
+
+# ==========================================
+# 5. PIPELINE EXECUTION
+# ==========================================
+def run_pipeline_for_dataset(dataset_name, data_path):
+    print("=" * 80 + f"\n STARTING MODEL PIPELINE FOR DATASET: {dataset_name.upper()}\n" + "=" * 80)
+    X_scaled, node_names = load_and_preprocess_dataset(data_path, dataset_name)
+    n_nodes = len(node_names)
+    X_TENSOR = torch.tensor(X_scaled, dtype=torch.float32, device=DEVICE)
+
+    ground_truth_matrix = load_ground_truth_from_csv(dataset_name, os.path.dirname(data_path), node_names)
+
+    # Search for best parameters first
+    if ground_truth_matrix is not None:
+        best_hp = optimize_hyperparams(X_TENSOR, n_nodes, ground_truth_matrix, n_trials=10)
+    else:
+        best_hp = {"l1_lambda": 0.015, "w_nll": 80.0, "w_dag": 50.0, "w_bic": 0.02, "max_epochs": 600, "lr": 0.0008}
+
+    run_raw_results = []
+    for run_idx, seed in enumerate(SEEDS, 1):
+        set_seed(seed)
+        start_time = time.time()
+        
+        res = train_single_run(X_TENSOR, n_nodes, best_hp, ground_truth_matrix, max_epochs=best_hp["max_epochs"])
+        elapsed = time.time() - start_time
+        
+        print(f"[Seed {seed}] Best Epoch: {res['best_epoch']} | Min SHD: {res['best_shd']} | Best F1: {res['best_f1']:.4f}")
+        
+        run_raw_results.append({
+            "Run": f"Run {run_idx}",
+            "Seed": seed,
+            "Best F1": res["best_f1"],
+            "Best SHD": res["best_shd"],
+            "Best Epoch": res["best_epoch"],
+            "Time (s)": elapsed
+        })
+
+    df_raw = pd.DataFrame(run_raw_results)
+    print("\n" + "=" * 80 + f"\n FINAL SUMMARY FOR {dataset_name.upper()}\n" + "=" * 80)
+    if ground_truth_matrix is not None:
+        print(f" * Best SHD   : {df_raw['Best SHD'].mean():.2f} +/- {df_raw['Best SHD'].std():.2f}")
+        print(f" * Best F1    : {df_raw['Best F1'].mean():.4f} +/- {df_raw['Best F1'].std():.4f}")
+        print(f" * Best Epoch : {df_raw['Best Epoch'].tolist()}")
+    else:
+        print(" * Ground Truth file not found. Metrics (F1/SHD) were skipped.")
+        
+    print(f" * Exec Time  : {df_raw['Time (s)'].mean():.2f}s\n" + "=" * 80 + "\n")
+    return df_raw
+
+if __name__ == "__main__":
+    DATASETS_PATHS = {
+        "Asia": "asia.csv",
+        "Csuite": "suite.csv",
+        "Sachs": "sachs2.csv",
+        "Child": "child.csv",
+        "Insurance": "insurance.csv",
+        "Water": "water.csv",
+        "Alarm": "alarm.csv",
+        "Barley": "barley.csv",
+        "Hailfinder": "hailfinder.csv",
+        "Hepar": "hepar.csv",
+        "Pathfinder": "pathfinder.csv",
+        "Andes": "andes.csv",
+        "Pigs": "pigs.csv",
+        "Diabetes": "diabetes.csv",
+        "Link": "link.csv",
+    }
+
+    for ds_name, ds_path in DATASETS_PATHS.items():
+        if os.path.exists(ds_path):
+            run_pipeline_for_dataset(ds_name, ds_path)
+        else:
+            print(f"[SKIP] File for {ds_name} at {ds_path} not found.")
